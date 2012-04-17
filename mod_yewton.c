@@ -35,39 +35,230 @@
 **    Content-Type: text/html
 **  
 **    The sample page from mod_yewton.c
-*/ 
+*/
 
 #include "httpd.h"
 #include "http_config.h"
+#include "http_log.h"
+#include "apr_strings.h"
+#include "apr_general.h"
+#include "util_filter.h"
+#include "apr_buckets.h"
+#include "http_request.h"
 #include "http_protocol.h"
 #include "ap_config.h"
+#include <stdlib.h>
+#include <memory.h>
+#include <jpeglib.h>
 
-/* The sample content handler */
-static int yewton_handler(request_rec *r)
+typedef struct {
+    char *img;
+    apr_size_t len;
+} yewton_module_ctx_t;
+
+/* メモリソースからのJPEG展開用マネージャ */
+typedef struct {
+    struct jpeg_source_mgr pub;/* public fields */
+
+    JOCTET * buffer;
+    unsigned long buffer_length;
+} memory_source_mgr;
+typedef memory_source_mgr *memory_src_ptr;
+
+METHODDEF(void) memory_init_source (j_decompress_ptr cinfo)
 {
-    if (strcmp(r->handler, "yewton")) {
-        return DECLINED;
-    }
-    r->content_type = "text/html";      
-
-    if (!r->header_only)
-        ap_rputs("The sample page from mod_yewton.c\n", r);
-    return OK;
 }
 
-static void yewton_register_hooks(apr_pool_t *p)
+
+METHODDEF(boolean) memory_fill_input_buffer (j_decompress_ptr cinfo)
 {
-    ap_hook_handler(yewton_handler, NULL, NULL, APR_HOOK_MIDDLE);
+    memory_src_ptr src = (memory_src_ptr) cinfo->src;
+
+    src->buffer[0] = (JOCTET) 0xFF;
+    src->buffer[1] = (JOCTET) JPEG_EOI;
+    src->pub.next_input_byte = src->buffer;
+    src->pub.bytes_in_buffer = 2;
+    return TRUE;
+}
+
+METHODDEF(void) memory_skip_input_data (j_decompress_ptr cinfo, long num_bytes)
+{
+    memory_src_ptr src = (memory_src_ptr) cinfo->src;
+
+    if (num_bytes > 0) {
+        src->pub.next_input_byte += (size_t) num_bytes;
+        src->pub.bytes_in_buffer -= (size_t) num_bytes;
+    }
+}
+
+METHODDEF(void) memory_term_source (j_decompress_ptr cinfo)
+{
+}
+
+GLOBAL(void)
+jpeg_memory_src (j_decompress_ptr cinfo, void* data, unsigned long len)
+{
+    memory_src_ptr src;
+
+    if (cinfo->src == NULL) {/* first time for this JPEG object? */
+        cinfo->src = (struct jpeg_source_mgr *)
+            (*cinfo->mem->alloc_small) ((j_common_ptr) cinfo, JPOOL_PERMANENT,
+                                        sizeof(memory_source_mgr));
+        src = (memory_src_ptr) cinfo->src;
+        src->buffer = (JOCTET *)
+            (*cinfo->mem->alloc_small) ((j_common_ptr) cinfo, JPOOL_PERMANENT,
+                                        len * sizeof(JOCTET));
+    }
+
+    src = (memory_src_ptr) cinfo->src;
+
+    src->pub.init_source = memory_init_source;
+    src->pub.fill_input_buffer = memory_fill_input_buffer;
+    src->pub.skip_input_data = memory_skip_input_data;
+    src->pub.resync_to_restart = jpeg_resync_to_restart; /* use default method */
+    src->pub.term_source = memory_term_source;
+
+    src->pub.bytes_in_buffer = len;
+    src->pub.next_input_byte = (JOCTET*)data;
+}
+
+static apr_status_t yewton_output_filter(ap_filter_t *f, apr_bucket_brigade *in_bb) {
+    const request_rec* const r = f->r;
+    yewton_module_ctx_t *ctx = f->ctx;
+
+    if(APR_BRIGADE_EMPTY(in_bb)) {
+        return APR_SUCCESS;
+    }
+
+    if(strcmp(r->content_type, "image/jpeg") != 0) {
+        ap_remove_output_filter(f);
+        return ap_pass_brigade(f->next, in_bb);
+    }
+
+    // initialize context at first time
+    if( !f->ctx ) {
+        // main request only.
+        if( r->main ) {
+            ap_remove_output_filter(f);
+            return ap_pass_brigade(f->next, in_bb);
+        }
+
+        // do nothing if not HTTP_OK.
+        if (r->status != HTTP_OK) {
+            ap_remove_output_filter(f);
+            return ap_pass_brigade(f->next, in_bb);
+        }
+
+        f->ctx = ctx = (yewton_module_ctx_t *)apr_pcalloc(r->pool, sizeof(yewton_module_ctx_t));
+        ctx->len = 0;
+    }
+
+    apr_bucket_brigade* const out_bb = apr_brigade_create(r->pool, f->c->bucket_alloc);
+
+    while(!APR_BRIGADE_EMPTY(in_bb)) {
+        apr_bucket* const e = APR_BRIGADE_FIRST(in_bb);
+
+        if(APR_BUCKET_IS_EOS(e)) {
+            // finally, output data process
+            APR_BUCKET_REMOVE(e);
+            APR_BRIGADE_INSERT_TAIL(out_bb, e);
+
+            struct jpeg_decompress_struct ds;
+            struct jpeg_error_mgr jerr;
+            int w, h;
+
+            ds.err = jpeg_std_error( &jerr );
+            jpeg_create_decompress( &ds );
+            jpeg_memory_src( &ds, ctx->img, ctx->len );
+            jpeg_read_header( &ds, TRUE );
+            jpeg_start_decompress( &ds );
+
+            w = ds.output_width;
+            h = ds.output_height;
+
+            if( (w < 300) || (h < 300) ) {
+                break;
+            }
+
+            jpeg_destroy_decompress( &ds );
+
+            apr_file_t *fp = NULL;
+            FILE *output;
+            apr_status_t rv;
+            char templ[] = "/usr/local/apache2/htdocs/images/img_XXXXXX";
+            const char *filename = apr_palloc(r->pool, 1024);
+
+            rv = apr_file_mktemp( &fp, templ, 0, r->pool );
+            apr_file_name_get( &filename, fp );
+            apr_file_close( fp );
+            filename = apr_pstrcat(r->pool, filename, ".jpg", NULL);
+
+            output = fopen(filename, "wb");
+            if(fp == NULL) {
+                ap_log_rerror(APLOG_MARK, APLOG_NOERRNO | APLOG_ERR, r->status, r, "can't open file %s.", filename);
+            } else {
+                fwrite(ctx->img, sizeof(unsigned char), ctx->len, output);
+                fclose(output);
+            }
+            free(ctx->img);
+
+            break;
+        }
+
+        if(APR_BUCKET_IS_FLUSH(e)) {
+            // need to flush
+            APR_BUCKET_REMOVE(e);
+            APR_BRIGADE_INSERT_TAIL(out_bb, e);
+            continue;
+        }
+        if (APR_BUCKET_IS_METADATA(e)) {
+            // remove meta data bucket
+            APR_BUCKET_REMOVE(e);
+            APR_BRIGADE_INSERT_TAIL(out_bb, e);
+            continue;
+        }
+        apr_size_t len;
+        const char* data;
+        apr_bucket_read(e, &data, &len, APR_NONBLOCK_READ);
+
+        apr_size_t org_len = ctx->len;
+        char* org_img = ctx->img;
+
+        apr_size_t new_len = org_len + len;
+        char* new_img = (char *)malloc(sizeof(char) * new_len);
+
+        if( 0 < org_len ) {
+            memcpy(new_img, org_img, org_len);
+            free(org_img);
+        }
+        memcpy(new_img + org_len, data, len);
+
+        ctx->len = new_len;
+        ctx->img = new_img;
+
+        apr_bucket* const b = apr_bucket_pool_create(data, len, r->pool, f->c->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(out_bb, b);
+
+        apr_bucket_delete(e);
+    }
+    apr_brigade_cleanup(in_bb);
+
+    return ap_pass_brigade(f->next, out_bb);
+}
+
+static void yewton_output_filter_register_hooks(apr_pool_t *p)
+{
+    ap_register_output_filter("YEWTONOUTPUTFILTER", yewton_output_filter, NULL, AP_FTYPE_RESOURCE);
 }
 
 /* Dispatch list for API hooks */
 module AP_MODULE_DECLARE_DATA yewton_module = {
-    STANDARD20_MODULE_STUFF, 
+    STANDARD20_MODULE_STUFF,
     NULL,                  /* create per-dir    config structures */
     NULL,                  /* merge  per-dir    config structures */
     NULL,                  /* create per-server config structures */
     NULL,                  /* merge  per-server config structures */
     NULL,                  /* table of config file commands       */
-    yewton_register_hooks  /* register hooks                      */
+    yewton_output_filter_register_hooks  /* register hooks        */
 };
 
